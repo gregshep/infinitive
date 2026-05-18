@@ -348,7 +348,7 @@ func mqttOnConnect(cl mqtt.Client) {
 			j, err := json.Marshal(&v)
 			log.Infof("MQTT PUB %v: %s", err, j)
 			if err == nil {
-				_ = cl.Publish("homeassistant/text_sensor/infinitive/" + v.Unique_id + "/config", 0, true, j)
+				_ = cl.Publish("homeassistant/sensor/infinitive/" + v.Unique_id + "/config", 0, true, j)
 			}
 		}
 
@@ -386,8 +386,8 @@ func mqttDiscoverZone(zi int, zn string, tu uint8) {
 	climateTemplate := `{
 	"name": "%[1]s",
 	"modes": [ "off", "cool", "heat", "auto" ],
-	"fan_modes": [ "high", "med", "low", "auto" ],
-	"preset_modes": [ "hold", "vacation" ],
+	"fan_modes": [ "High", "Medium", "Low", "Auto" ],
+	"preset_modes": [ "Home", "Away", "Sleep", "Wake", "Hold", "Vacation" ],
 	"current_humidity_topic": "%[4]s/zone/%[2]d/humidity",
 	"current_temperature_topic": "%[4]s/zone/%[2]d/currentTemp",
 	"fan_mode_state_topic": "%[4]s/zone/%[2]d/fanMode",
@@ -418,6 +418,28 @@ func mqttDiscoverZone(zi int, zn string, tu uint8) {
 		}
 		textSensors := []discoveryTopicTextSensor {
 		}
+	for _, profile := range comfortProfileTopicNames {
+		profileName := strings.ToLower(profile)
+		sensors = append(sensors,
+			discoveryTopicSensor{ "%[4]s/zone/%[2]d/comfortProfile" + profile + "HeatSetPoint", "%[1]s " + profile + " Heat Setpoint", "temperature", "measurement", "°F", "hvac-sensors-z%[2]d-cp-" + profileName + "-heat", a },
+			discoveryTopicSensor{ "%[4]s/zone/%[2]d/comfortProfile" + profile + "CoolSetPoint", "%[1]s " + profile + " Cool Setpoint", "temperature", "measurement", "°F", "hvac-sensors-z%[2]d-cp-" + profileName + "-cool", a },
+		)
+		textSensors = append(textSensors,
+			discoveryTopicTextSensor{ "%[4]s/zone/%[2]d/comfortProfile" + profile + "FanMode", "%[1]s " + profile + " Fan Mode", "hvac-text-z%[2]d-cp-" + profileName + "-fan", a },
+		)
+	}
+	for _, dayName := range scheduleDayNames {
+		dayID := strings.ToLower(dayName)
+		textSensors = append(textSensors,
+			discoveryTopicTextSensor{ "%[4]s/zone/%[2]d/scheduleProgram" + dayName, "%[1]s " + dayName + " Schedule", "hvac-text-z%[2]d-sched-" + dayID, a },
+		)
+		for period := 1; period <= 5; period++ {
+			textSensors = append(textSensors,
+				discoveryTopicTextSensor{ fmt.Sprintf("%%[4]s/zone/%%[2]d/scheduleProgram%sPeriod%dTime", dayName, period), fmt.Sprintf("%%[1]s %s Period %d Time", dayName, period), fmt.Sprintf("hvac-text-z%%[2]d-sched-%s-p%d-time", dayID, period), a },
+				discoveryTopicTextSensor{ fmt.Sprintf("%%[4]s/zone/%%[2]d/scheduleProgram%sPeriod%dComfortProfile", dayName, period), fmt.Sprintf("%%[1]s %s Period %d Comfort Profile", dayName, period), fmt.Sprintf("hvac-text-z%%[2]d-sched-%s-p%d-profile", dayID, period), a },
+			)
+		}
+	}
 	tempu := "F"
 	if tu > 0 { tempu = "C" }
 	duid := fmt.Sprintf("climate-zone-%d", zi+1)
@@ -464,7 +486,7 @@ func mqttDiscoverZone(zi int, zn string, tu uint8) {
 			j, err := json.Marshal(&v)
 			log.Infof("MQTT ZONE TEXT SENSOR DISC: %v", j)
 			if err == nil {
-				_ = mqttClient.Publish("homeassistant/text_sensor/infinitive/" + v.Unique_id + "/config", 0, true, j)
+				_ = mqttClient.Publish("homeassistant/sensor/infinitive/" + v.Unique_id + "/config", 0, true, j)
 			}
 		}
 

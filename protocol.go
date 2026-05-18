@@ -16,8 +16,8 @@ const (
 	devSAM   = uint16(0x9201)
 )
 
-const responseTimeout = 500
-const responseRetries = 5
+var responseTimeout = 1200
+var responseRetries = 0
 
 type snoopCallback func(*InfinityFrame)
 
@@ -335,59 +335,80 @@ func (p *InfinityProtocol) performAction(action *Action) {
 
 	p.stats.aact++
 	stime := time.Now()
+	seq := commandLog.NextSeq()
 
-	p.sendFrame(encodedFrame)
-	ticker := time.NewTicker(time.Millisecond * responseTimeout)
-	defer ticker.Stop()
-	for tries := 0; tries < responseRetries; {
-		select {
-		case res := <-p.responseCh:
-			// at this point we just know it's an opRRESPONSE but could be to someone else
-			// or to us from a different thread
-			if res.src != action.requestFrame.dst {
-				p.stats.aother++
-				continue
-			}
+	for attempt := 0; ; attempt++ {
+		commandLog.Log("tx", seq, attempt, action.requestFrame, encodedFrame, nil, time.Since(stime), "")
+		p.sendFrame(encodedFrame)
+		timer := time.NewTimer(time.Millisecond * time.Duration(responseTimeout))
 
-			// if it was a READ, the table must match; if it was a WRITE the resp len must be 1 and the resp must be 00
-			if action.requestFrame.op == opREAD {
-				// check for a write resp coming in for a read req, can happen if the write resp was delayed and we timed out waiting for it
-				if len(res.data) < 3 {
+		for {
+			select {
+			case res := <-p.responseCh:
+				// at this point we just know it's an opRRESPONSE but could be to someone else
+				// or to us from a different thread
+				if res.src != action.requestFrame.dst {
 					p.stats.aother++
-					continue;
-				}
-
-				reqTable := action.requestFrame.data[0:3]
-				resTable := res.data[0:3]
-
-				if !bytes.Equal(reqTable, resTable) {
-					p.stats.aother++
+					commandLog.Log("ignore", seq, attempt, action.requestFrame, nil, res, time.Since(stime), "unexpected response source")
 					continue
 				}
-			} else if action.requestFrame.op == opWRITE {
-				if res.dataLen != 1 || !bytes.Equal(res.data[0:1], []byte{00}) {
-					p.stats.aother++
-					continue
+
+				// if it was a READ, the table must match; if it was a WRITE the resp len must be 1 and the resp must be 00
+				if action.requestFrame.op == opREAD {
+					// check for a write resp coming in for a read req, can happen if the write resp was delayed and we timed out waiting for it
+					if len(res.data) < 3 {
+						p.stats.aother++
+						commandLog.Log("ignore", seq, attempt, action.requestFrame, nil, res, time.Since(stime), "short read response")
+						continue
+					}
+
+					reqTable := action.requestFrame.data[0:3]
+					resTable := res.data[0:3]
+
+					if !bytes.Equal(reqTable, resTable) {
+						p.stats.aother++
+						commandLog.Log("ignore", seq, attempt, action.requestFrame, nil, res, time.Since(stime), "response table mismatch")
+						continue
+					}
+				} else if action.requestFrame.op == opWRITE {
+					if res.dataLen != 1 || !bytes.Equal(res.data[0:1], []byte{00}) {
+						p.stats.aother++
+						commandLog.Log("ignore", seq, attempt, action.requestFrame, nil, res, time.Since(stime), "write response was not ack")
+						continue
+					}
 				}
+
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				if attempt == 0 { p.stats.aok1++ } else {p.stats.aokN++ }
+				p.stats.aokms = p.stats.aokms + time.Since(stime).Milliseconds()
+
+				action.responseFrame = res
+				commandLog.Log("ok", seq, attempt, action.requestFrame, nil, res, time.Since(stime), "")
+				// log.Printf("got response!")
+				action.ok = true
+				action.ch <- true
+				// log.Printf("sent action!")
+				return
+			case <-timer.C:
+				if attempt >= responseRetries {
+					commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "no matching response")
+					goto timedOut
+				}
+				log.Debug("timeout waiting for response, retransmitting frame")
+				commandLog.Log("retry", seq, attempt+1, action.requestFrame, encodedFrame, nil, time.Since(stime), "timeout waiting for response")
+				p.stats.aretr++
+				goto retry
 			}
-
-			if tries == 0 { p.stats.aok1++ } else {p.stats.aokN++ }
-			p.stats.aokms = p.stats.aokms + time.Since(stime).Milliseconds()
-
-			action.responseFrame = res
-			// log.Printf("got response!")
-			action.ok = true
-			action.ch <- true
-			// log.Printf("sent action!")
-			return
-		case <-ticker.C:
-			log.Debug("timeout waiting for response, retransmitting frame")
-			p.stats.aretr++
-			p.sendFrame(encodedFrame)
-			tries++
 		}
+retry:
 	}
 
+timedOut:
 	log.Printf("action timed out")
 	p.stats.afailms = p.stats.afailms + time.Since(stime).Milliseconds()
 	p.stats.afail++

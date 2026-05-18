@@ -38,13 +38,13 @@ func stringModeToRaw(mode string) (uint8, bool) {
 func rawFanModeToString(mode uint8) string {
 	switch mode {
 	case 0:
-		return "auto"
+		return "Auto"
 	case 1:
-		return "low"
+		return "Low"
 	case 2:
-		return "med"
+		return "Medium"
 	case 3:
-		return "high"
+		return "High"
 	default:
 		return "unknown"
 	}
@@ -52,13 +52,13 @@ func rawFanModeToString(mode uint8) string {
 
 func stringFanModeToRaw(mode string) (uint8, bool) {
 	switch mode {
-	case "auto":
+	case "auto", "Auto":
 		return 0, true
-	case "low":
+	case "low", "Low":
 		return 1, true
-	case "med":
+	case "med", "medium", "Medium":
 		return 2, true
-	case "high":
+	case "high", "High":
 		return 3, true
 	default:
 		return 0, false

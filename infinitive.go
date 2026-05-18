@@ -279,7 +279,7 @@ func appendRuntimeZones(zoneArr [8]TStatZoneConfig, zc int) ([8]TStatZoneConfig,
 				ZoneNumber:       uint8(zi+1),
 				CurrentTemp:      rz.CurrentTemp,
 				CurrentHumidity:  rz.CurrentHumidity,
-				FanMode:          "auto",
+				FanMode:          "Auto",
 				Hold:             &holdz,
 				Preset:           "none",
 				HeatSetpoint:     rz.HeatSetpoint,
@@ -453,7 +453,7 @@ func getZonesConfig() (*TStatZonesConfig, bool) {
 			presetz := "none"
 
 			if holdz {
-				presetz = "hold"
+				presetz = "Hold"
 			}
 
 			zName := string(bytes.Trim(cfg.ZName[zi][:], " \000"))
@@ -558,7 +558,11 @@ func putConfig(zone string, param string, value string) bool {
 			switch value {
 				case "hold":
 					val = true
+				case "Hold":
+					val = true
 				case "none":
+					val = false
+				case "None":
 					val = false
 				default:
 					log.Errorf("putConfig: invalid preset value '%s' for zone %d", value, zn)
@@ -640,7 +644,7 @@ func getZNConfig(zi int) (*TStatZoneConfig, bool) {
 	presetz := "none"
 
 	if hold {
-		presetz = "hold"
+		presetz = "Hold"
 	}
 
 	return &TStatZoneConfig{
@@ -832,10 +836,26 @@ func deleteMqttDiscovery(component string, uniqueID string) {
 	mqttClient.Publish(topic, 0, true, []byte{})
 }
 
-var comfortProfileNames = []string{"home", "away", "sleep", "wake"}
+var comfortProfileNames = []string{"Home", "Away", "Sleep", "Wake"}
 var comfortProfileTopicNames = []string{"Home", "Away", "Sleep", "Wake"}
-var comfortProfileFanNames = []string{"off", "low", "med", "high"}
+var comfortProfileFanNames = []string{"Off", "Low", "Medium", "High"}
 var scheduleDayNames = []string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+
+type zoneComfortProfile struct {
+	Heat  uint8
+	Cool  uint8
+	Fan   string
+	Valid bool
+}
+
+type zoneSchedulePeriod struct {
+	Tick     uint8
+	Profile  uint8
+	Valid    bool
+}
+
+var zoneComfortProfiles [8][4]zoneComfortProfile
+var zoneSchedules [8][7][5]zoneSchedulePeriod
 
 func comfortProfileFanName(fan uint8) string {
 	if fan < uint8(len(comfortProfileFanNames)) {
@@ -860,6 +880,91 @@ func publishComfortProfile(topic string, data []byte) {
 		publishAnyTopic(topicBase+"CoolSetPoint", data[base+1])
 		publishTextTopic(topicBase+"FanMode", fan)
 	}
+}
+
+func updateZoneComfortProfiles(zi int, data []byte) {
+	if zi < 0 || zi >= len(zoneComfortProfiles) || len(data) < len(comfortProfileNames)*7 {
+		return
+	}
+	for i := range comfortProfileNames {
+		base := i * 7
+		zoneComfortProfiles[zi][i] = zoneComfortProfile{
+			Heat:  data[base],
+			Cool:  data[base+1],
+			Fan:   comfortProfileFanName(data[base+2]),
+			Valid: true,
+		}
+	}
+}
+
+func zoneComfortProfileName(zi int, heat uint8, cool uint8) string {
+	if zi < 0 || zi >= len(zoneComfortProfiles) {
+		return "none"
+	}
+	if scheduledProfile, ok := activeScheduledProfile(zi); ok && int(scheduledProfile) < len(zoneComfortProfiles[zi]) {
+		profile := zoneComfortProfiles[zi][scheduledProfile]
+		if profile.Valid && profile.Heat == heat && profile.Cool == cool {
+			return comfortProfileNames[scheduledProfile]
+		}
+	}
+	for i, profile := range zoneComfortProfiles[zi] {
+		if profile.Valid && profile.Heat == heat && profile.Cool == cool {
+			return comfortProfileNames[i]
+		}
+	}
+	return "none"
+}
+
+func updateZoneSchedule(zi int, data []byte) {
+	if zi < 0 || zi >= len(zoneSchedules) || len(data) < len(scheduleDayNames)*10 {
+		return
+	}
+	for dayIndex := range scheduleDayNames {
+		dayData := data[dayIndex*10 : dayIndex*10+10]
+		for period := 0; period < 5; period++ {
+			timeTick := dayData[period*2]
+			activity := dayData[period*2+1]
+			zoneSchedules[zi][dayIndex][period] = zoneSchedulePeriod{
+				Tick:     timeTick,
+				Profile:  activity,
+				Valid:    timeTick < 0x60 && int(activity) < len(comfortProfileNames),
+			}
+		}
+	}
+}
+
+func activeScheduledProfile(zi int) (uint8, bool) {
+	if zi < 0 || zi >= len(zoneSchedules) {
+		return 0, false
+	}
+	now := time.Now()
+	tick := uint8((now.Hour()*60 + now.Minute()) / 15)
+	day := int(now.Weekday())
+
+	for daysBack := 0; daysBack < len(scheduleDayNames); daysBack++ {
+		checkDay := (day - daysBack + len(scheduleDayNames)) % len(scheduleDayNames)
+		bestTick := uint8(0)
+		bestProfile := uint8(0)
+		bestFound := false
+		for _, period := range zoneSchedules[zi][checkDay] {
+			if !period.Valid {
+				continue
+			}
+			if daysBack == 0 && period.Tick > tick {
+				continue
+			}
+			if !bestFound || period.Tick >= bestTick {
+				bestTick = period.Tick
+				bestProfile = period.Profile
+				bestFound = true
+			}
+		}
+		if bestFound {
+			return bestProfile, true
+		}
+	}
+
+	return 0, false
 }
 
 func scheduleTimeString(tick uint8) string {
@@ -941,8 +1046,8 @@ func deleteDeprecatedMqttTopics() {
 
 	deleteComfortProfileTopics("comfortProfile")
 	deleteScheduleTopics("scheduleProgram")
-	deleteMqttDiscovery("text_sensor", "hvac-text-comfort-profile")
-	deleteMqttDiscovery("text_sensor", "hvac-text-schedule-program")
+	deleteMqttDiscovery("sensor", "hvac-text-comfort-profile")
+	deleteMqttDiscovery("sensor", "hvac-text-schedule-program")
 
 	for zi := 1; zi <= 8; zi++ {
 		deleteMqttTopic(fmt.Sprintf("zone/%d/comfortProfile", zi))
@@ -951,8 +1056,8 @@ func deleteDeprecatedMqttTopics() {
 		deleteMqttTopic(fmt.Sprintf("zone/%d/comfortProfileManualFanMode", zi))
 		deleteMqttTopic(fmt.Sprintf("zone/%d/scheduleProgram", zi))
 		deleteMqttTopic(fmt.Sprintf("zone/%d/scheduleProgramRaw", zi))
-		deleteMqttDiscovery("text_sensor", fmt.Sprintf("hvac-text-z%d-comfort-profile", zi))
-		deleteMqttDiscovery("text_sensor", fmt.Sprintf("hvac-text-z%d-schedule-program", zi))
+		deleteMqttDiscovery("sensor", fmt.Sprintf("hvac-text-z%d-comfort-profile", zi))
+		deleteMqttDiscovery("sensor", fmt.Sprintf("hvac-text-z%d-schedule-program", zi))
 	}
 
 	for i := 1; i <= 6; i++ {
@@ -997,9 +1102,11 @@ func publishZoneProgram(zi int) {
 		return
 	}
 	if data, ok := readRawTable(devTSTAT, []byte{0x00, 0x40, byte(0x02+zi)}); ok {
+		updateZoneSchedule(zi, data)
 		publishSchedule(topicPrefix+"/scheduleProgram", data)
 	}
 	if data, ok := readRawTable(devTSTAT, []byte{0x00, 0x40, byte(0x0a+zi)}); ok {
+		updateZoneComfortProfiles(zi, data)
 		publishComfortProfile(topicPrefix+"/comfortProfile", data)
 	}
 }
@@ -1031,26 +1138,35 @@ func getDamperPosition() (DamperPosition, bool) {
 	return *th, true
 }
 
-func metadataPoller() {
+func metadataPoller(interval time.Duration) {
 	meta_i := 0
+	deleteDeprecatedMqttTopics()
+	for zi := 0; zi < 8; zi++ {
+		publishZoneProgram(zi)
+		time.Sleep(time.Millisecond * 500)
+	}
 	for {
 		deleteDeprecatedMqttTopics()
 		publishThermostatMetadata(meta_i)
 		publishZoneProgram(meta_i % 8)
 		meta_i++
-		time.Sleep(time.Second * 5)
+		time.Sleep(interval)
 	}
 }
 
-func statePoller(monArray []uint16) {
+func statePoller(monArray []uint16, interval time.Duration, pollTstatTemps bool) {
 	mon_i := 0
 	cyc_i := 0
 	potentially_drying := true	// prove this wrong
+	var c2 *APIVacationConfig
+	var c2ok bool
 
 	for {
 		// called once for all zones
 		c1, c1ok := getZonesConfig()
-		c2, c2ok := getVacationConfig()
+		if cyc_i == 0 {
+			c2, c2ok = getVacationConfig()
+		}
 
 		pf := fmt.Sprintf("mqtt/%s", instanceName)
 
@@ -1069,9 +1185,13 @@ func statePoller(monArray []uint16) {
 				mqttCache.update(zp+"/hold", *c1.Zones[zi].Hold)
 				mqttCache.update(zp+"/overrideDurationMins", c1.Zones[zi].OvrdDurationMins)
 				if c2ok && *c2.Active {
-					mqttCache.update(zp+"/preset", "vacation")
+					mqttCache.update(zp+"/preset", "Vacation")
 				} else {
-					mqttCache.update(zp+"/preset", c1.Zones[zi].Preset)
+					preset := c1.Zones[zi].Preset
+					if preset == "none" {
+						preset = zoneComfortProfileName(int(c1.Zones[zi].ZoneNumber-1), c1.Zones[zi].HeatSetpoint, c1.Zones[zi].CoolSetpoint)
+					}
+					mqttCache.update(zp+"/preset", preset)
 				}
 
 				if hum <= c1.Zones[zi].TargetHumidity || c1.Zones[zi].CurrentTemp > c1.Zones[zi].CoolSetpoint {
@@ -1116,7 +1236,7 @@ func statePoller(monArray []uint16) {
 		}
 
 			// things to poll less-often
-			if c1ok && cyc_i == 0 {
+			if pollTstatTemps && c1ok && cyc_i == 0 {
 				c3, c3ok := getTstatTemps()
 				if c3ok {
 					for zi := range c1.Zones {
@@ -1133,7 +1253,7 @@ func statePoller(monArray []uint16) {
 			mon_i = (mon_i + 1) % len(monArray)
 		}
 
-		time.Sleep(time.Second * 1)
+		time.Sleep(interval)
 	}
 }
 
@@ -1389,11 +1509,22 @@ func main() {
 	showDryingOpt := flag.Bool("drying", false, "enable reporting of Drying HVAC action")
 	exposeWifiPasswordOpt := flag.Bool("expose-wifi-password", false, "publish thermostat WiFi password to MQTT")
 	noPoll := flag.Bool("nopoll", false, "disable periodic polling")
+	pollInterval := flag.Duration("poll-interval", 5*time.Second, "interval for normal thermostat state polling")
+	metadataPollInterval := flag.Duration("metadata-poll-interval", 5*time.Minute, "interval for thermostat metadata/program polling; <=0 disables it")
+	pollTstatTemps := flag.Bool("poll-tstat-temps", false, "poll legacy thermostat raw temp16 table")
+	responseTimeoutOpt := flag.Int("response-timeout-ms", responseTimeout, "milliseconds to wait for a matching bus response")
+	responseRetriesOpt := flag.Int("response-retries", responseRetries, "number of retransmits after the initial bus command")
 	var busCapturePath busCaptureFlag
 	flag.Var(&busCapturePath, "buscap", "capture decoded bus traffic to a JSONL file")
+	commandLogPath := busCaptureFlag{enabled: true, path: "commandlog.jsonl"}
+	flag.Var(&commandLogPath, "cmdlog", "log Infinitive-originated bus commands to a JSONL file")
 	capRotate := flag.Bool("capture-rotate", false, "rotate capture file on open instead of appending")
 
 	flag.Parse()
+	if commandLogPath.enabled && commandLogPath.auto && flag.NArg() > 0 && !strings.HasPrefix(flag.Arg(0), "-") {
+		commandLogPath.auto = false
+		commandLogPath.path = flag.Arg(0)
+	}
 
 	// validate the instance name
 	if instance == nil || len(*instance) == 0 || len(*instance) > 32 || strings.ContainsAny(*instance, " $#+*/") {
@@ -1427,6 +1558,19 @@ func main() {
 	customFormatter.FullTimestamp = true
 	log.SetFormatter(customFormatter)
 
+	if responseTimeoutOpt == nil || *responseTimeoutOpt <= 0 {
+		fmt.Print("response-timeout-ms must be greater than zero\n")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	if responseRetriesOpt == nil || *responseRetriesOpt < 0 {
+		fmt.Print("response-retries must be greater than or equal to zero\n")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	responseTimeout = *responseTimeoutOpt
+	responseRetries = *responseRetriesOpt
+
 	if doRespLog != nil && *doRespLog {
 		if !RLogger.Open() {
 			panic("unable to open resp log file")
@@ -1443,6 +1587,17 @@ func main() {
 			panic("unable to open bus capture file")
 		}
 		defer busCapture.Close()
+	}
+
+	if commandLogPath.enabled {
+		path := commandLogPath.path
+		if commandLogPath.auto {
+			path = autoCommandLogPath()
+		}
+		if !commandLog.Open(path, *capRotate) {
+			panic("unable to open command log file")
+		}
+		defer commandLog.Close()
 	}
 
 	infinity = &InfinityProtocol{device: *serialPort}
@@ -1516,8 +1671,10 @@ func main() {
 	}
 
 	if noPoll == nil || !*noPoll {
-		go statePoller(rawMonTable)
-		go metadataPoller()
+		go statePoller(rawMonTable, *pollInterval, *pollTstatTemps)
+		if metadataPollInterval != nil && *metadataPollInterval > 0 {
+			go metadataPoller(*metadataPollInterval)
+		}
 		go statsPoller()
 	}
 	webserver(*httpPort)
