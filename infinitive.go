@@ -131,19 +131,6 @@ func holdTime(ht uint16) string {
 	return fmt.Sprintf("%d:%02d", ht/60, ht % 60)
 }
 
-// On this thermostat, clearing a timed "hold until" override is done through
-// the same zone-hold write used to resume schedule. A duration write of 0 does
-// not reliably clear S1Z1OVR on its own, so overrideDurationMins=0 must map to
-// ZoneHold=false.
-func writeZoneResumeSchedule(zoneNumber int) bool {
-	if zoneNumber < 1 || zoneNumber > 8 {
-		return false
-	}
-
-	params := TStatZoneParams{}
-	return infinity.WriteTableZ(devTSTAT, params, uint8(zoneNumber-1), 0x02)
-}
-
 // Flag 0x80 sets the override timer independently of setpoints.
 // A duration of 0 is the API/"resume schedule" form and is translated here to
 // the ZoneHold=false write, because writing a raw 0 duration does not reliably
@@ -151,9 +138,6 @@ func writeZoneResumeSchedule(zoneNumber int) bool {
 func writeZoneOverrideDuration(zoneNumber int, durationMins uint16) bool {
 	if zoneNumber < 1 || zoneNumber > 8 {
 		return false
-	}
-	if durationMins == 0 {
-		return writeZoneResumeSchedule(zoneNumber)
 	}
 	if durationMins > maxOverrideDurationMins {
 		durationMins = maxOverrideDurationMins
