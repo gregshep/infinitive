@@ -134,7 +134,25 @@ Each line in the capture file is a JSON object describing one bus frame. The mai
   * `op_name`: decoded operation name such as `READ`, `WRITE`, or `RESPONSE`
   * `data_hex`: decoded payload bytes as hex
 
-Compared to `-rlog`, `-buscap` captures both transmitted and received frames, preserves raw bytes, and keeps undecodable traffic for later analysis.
+The numeric and hex address/op fields are intentionally redundant:
+
+  * the numeric fields are easier for scripts and numeric comparisons
+  * the hex fields are easier to read when working with Infinity bus addresses such as `0x9201` and `0x2001`
+
+Compared to `-rlog`, `-buscap` has several advantages:
+
+  * it records both transmitted (`tx`) and received (`rx`) frames, while `-rlog` records only decoded received traffic
+  * it preserves the full raw frame bytes in `raw_hex`
+  * it records undecodable/corrupt traffic with `valid=false`, which `-rlog` drops
+  * it is easier to analyze with scripts because each frame is a structured JSON record
+  * it includes both numeric and hex address fields, so it is convenient for both machine processing and human-readable inspection
+
+If you need to know exactly what infinitive sent onto the bus, prefer `-buscap`. `-rlog` is mainly useful as a lighter-weight text log of decoded inbound traffic.
+
+Example:
+```json
+{"ts":"2026-03-20T23:04:01.546184125-07:00","unix_ms":1774073041546,"dir":"tx","raw_hex":"...","valid":true,"src":37377,"src_hex":"0x9201","dst":8193,"dst_hex":"0x2001","op":12,"op_hex":"0x0c","op_name":"WRITE","data_hex":"003b03010002..."}
+```
 
   * Enable debug level logging:
 ```
@@ -261,6 +279,7 @@ Replace [Z] with any zone number 1-8.  If you want data for multiple zones, it's
    "stage":2,
    "fanMode": "auto",
    "hold": true,
+   "overrideActive": false,
    "targetHumidity": 52,
    "zoneName": "Downstairs",
    "overrideDuration": "1:50",
@@ -275,11 +294,17 @@ rawMode included for debugging purposes. It encodes stage and mode.
 Note that paramers stage, mode, outdoorTemp, and rawMode are global across all zones but for historical reasons they are present
 in the per-zone query.
 
+For zone scheduling state:
+- `hold` is the permanent hold flag
+- `overrideActive` is the separate ON/OFF flag for the `hold until` override
+- `overrideDurationMins` is the remaining override value when that flag is set
+
 #### PUT /api/zone/[Z]/config
 
 Replace [Z] with any zone number 1-8.  One or more parameters to write should be included in the JSON body.  Parameters that are not
-mentioned are not changed.  The only parameters that are settable are "fanMode", "heatSetpoint", "coolSetpoint", and "hold", as well as the global
-parameter "mode". `targetHumidity` is read-only.
+mentioned are not changed. `overrideActive` is read-only and may not be written. The only zone parameters that are settable are
+`fanMode`, `heatSetpoint`, `coolSetpoint`, `hold`, and `overrideDurationMins`, as well as the global parameter `mode`.
+`targetHumidity` is read-only.
 
 ```json
 {
@@ -317,6 +342,7 @@ dictionary.  These parameters may for now also be inside the per-zone structures
 	 "zoneName":"Downstairs",
 	 "fanMode":"low",
 	 "hold":true,
+	 "overrideActive":false,
 	 "heatSetpoint":72,
 	 "coolSetpoint":82,
 	 "overrideDuration":"",
@@ -334,6 +360,7 @@ dictionary.  These parameters may for now also be inside the per-zone structures
 	 "zoneName":"Upstairs",
 	 "fanMode":"med",
 	 "hold":false,
+	 "overrideActive":true,
 	 "heatSetpoint":73,
 	 "coolSetpoint":83,
 	 "overrideDuration":"1:25",
@@ -474,12 +501,13 @@ Reported per zone, where X is a zone number 1-8:
 * `infinitive/zone/X/coolSetpoint`: current cool set point, in whole degrees
 * `infinitive/zone/X/heatSetpoint`: current heat set point, in whole degrees
 * `infinitive/zone/X/fanMode`: current fan mode setting, Home Assistant compatible: `low`, `med`, `high`, `auto`
-* `infinitive/zone/X/hold`: bool flag for Hold setting, `false` or `true` (not really useful with HA -- use `preset` instead)
+* `infinitive/zone/X/hold`: bool flag for permanent Hold, `false` or `true` (not really useful with HA -- use `preset` instead)
+* `infinitive/zone/X/overrideActive`: bool flag for the `hold until` override state
 * `infinitive/zone/X/preset`: HA-style "preset" flag; currently `hold`, `vacation`, or `none`
 * `infinitive/zone/X/damperPos`: zone damper position reported by zoning unit, 0-100 as whole number percent where 100 is fully open
 * `infinitive/zone/X/flowWeight`: airflow allocation factor for this zone as a decimal fraction (0-1) - multiply the total airflowCFM
   by this number to get the reported airflow for this zone.
-* `infinitive/zone/X/overrideDurationMins`: minutes remaining on zone setting override, zero if none
+* `infinitive/zone/X/overrideDurationMins`: minutes remaining on zone override (`hold until`), zero if none
 * `infinitive/zone/X/temp16`: high resolution, unsmoothed temperature, as a decimal number to .0625 degree precision
 
 HomeAssistant MQTT Discovery topics published:
@@ -487,6 +515,8 @@ HomeAssistant MQTT Discovery topics published:
   * all the "global" sensors: `outdoorTemp`, `humidity`, `rawMode`, `blowerRPM`, `airflowCFM`, `staticPressure`, `coolStage`, `heatStage`, `action`
   * all the vacation sensors: `vacation/active`, `vacation/days`, `vacation/hours`, `vacation/minTemp`, `vacation/maxTemp`, `vacation/minHumidity`, `vacation/maxHumidity`, `vacation/fanMode`
   * per-zone "bonus" sensors (not supported by the Climate integration): `damperPos`, `flowWeight`, `overrideDurationMins`, `temp16`
+* `homeassistant/number/infinitive/*/config`: discovery topics, one per writable number entity, for:
+  * per-zone readable and settable numeric values: `overrideDurationMins`
 * `homeassistant/button/infinitive/*/config`: discovery topics to create "buttons" as a convenience to manipulate vacation timing:
   * "HVAC Vacation Cancel", "HVAC Vacation Add 1 Hour", "HVAC Vacation Subtract 1 Hour", "HVAC Vacation 1 Hour", and so on (total of 18 buttons)
 * `homeassistant/climate/infinitive/*/config`: discovery topics, one per zone, for an MQTT HVAC climate entity, which includes:
@@ -576,6 +606,7 @@ Zone topics:
 * `infinitive/zone/X/fanMode/set`: set the fan mode setting, same options as above
 * `infinitive/zone/X/hold/set`: set the zone hold setting, same options as above
 * `infinitive/zone/X/preset/set`: set the zone "preset" setting, `hold` or `none`; `vacation` cannot be set here but setting `hold` will unset it
+* `infinitive/zone/X/overrideDurationMins/set`: set the remaining override duration in minutes; `0` cancels any remaining override time and resumes schedule
 
 Again remember that the "infinitive/" prefix on these subscribed names will be changed to the instance name if one is provided.  This allows multiple instances of Infinitive to coexist on one MQTT bus.
 

@@ -34,6 +34,19 @@ type discoveryTopicButton struct {
 	Avail	    string    `json:"availability_topic,omitempty"`
 }
 
+type discoveryTopicNumber struct {
+	StateTopic   string `json:"state_topic"`
+	CommandTopic string `json:"command_topic"`
+	Name         string `json:"name"`
+	Mode         string `json:"mode,omitempty"`
+	Min          uint16 `json:"min"`
+	Max          uint16 `json:"max"`
+	Step         uint16 `json:"step"`
+	UoM          string `json:"unit_of_measurement,omitempty"`
+	Unique_id    string `json:"unique_id"`
+	Avail        string `json:"availability_topic,omitempty"`
+}
+
 type EventDispatcher struct {
 	listeners  map[*EventListener]bool
 	broadcast  chan []byte
@@ -67,12 +80,12 @@ func serializeEvent(source string, data interface{}) []byte {
 }
 
 func (d *EventDispatcher) broadcastEvent(source string, data interface{}) {
-	if len(source) > 6 && source[0:6] == "local/" {
+	if len(source) >= 6 && source[0:6] == "local/" {
 		// local events don't broadcast anywhere
 		topic := source[6:]
 		value := fmt.Sprintf("%v", data)
 		log.Infof("LOCAL: %s -> %s", topic, value)
-	} else if source[0:5] == "mqtt/" {
+	} else if len(source) >= 5 && source[0:5] == "mqtt/" {
 		if mqttClient != nil {
 			topic := source[5:]
 			value := fmt.Sprintf("%v", data)
@@ -120,8 +133,8 @@ func  mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 		log.Errorf("mqtt received unexpected topic '%s'", msg.Topic())
 	} else if len(ts) == 5 && ts[1] == "zone" {
 		// zone-based
-		if ps[len(ps)-2:len(ps)-1] == "." {
-			ps = ps[0:len(ps)-2]
+		if strings.HasSuffix(ps, ".0") {
+			ps = ps[:len(ps)-2]
 		}
 		_ = putConfig(ts[2], ts[3], ps)
 	} else if len(ts) == 4 && ts[1] == "vacation" {
@@ -149,7 +162,13 @@ func ConnectMqtt(url string, password string) {
 	co.SetPassword(password)
 	co.SetClientID(instanceName + "_mqtt_client")
 	co.SetOnConnectHandler(mqttOnConnect)
-	co.SetConnectionLostHandler(func(cl mqtt.Client, err error) {log.Info("MQTT: Connection lost: ", err.Error())})
+	co.SetConnectionLostHandler(func(cl mqtt.Client, err error) {
+		if err != nil {
+			log.Info("MQTT: Connection lost: ", err.Error())
+		} else {
+			log.Info("MQTT: Connection lost")
+		}
+	})
 	co.SetReconnectingHandler(func(cl mqtt.Client, _ *mqtt.ClientOptions) {log.Info("MQTT: Trying to reconnect")})
 	co.SetConnectRetry(true)
 	co.SetConnectRetryInterval(time.Minute)
@@ -301,7 +320,7 @@ func mqttOnConnect(cl mqtt.Client) {
 // post discovery message if needed
 func mqttDiscoverZone(zi int, zn string, tu uint8) {
 
-	if mqttZoneFlags[zi] || !mqttClient.IsConnected() {
+	if mqttClient == nil || mqttZoneFlags[zi] || !mqttClient.IsConnected() {
 		return
 	}
 
@@ -336,8 +355,12 @@ func mqttDiscoverZone(zi int, zn string, tu uint8) {
 	sensors := []discoveryTopicSensor {
 		{ "%[4]s/zone/%[2]d/damperPos", "%[1]s Damper Postion", "", "measurement", "%", "hvac-sensors-z%[2]d-dpos", a},
 		{ "%[4]s/zone/%[2]d/flowWeight", "%[1]s Airflow Weight", "", "measurement", "", "hvac-sensors-z%[2]d-fwgt", a},
-		{ "%[4]s/zone/%[2]d/overrideDurationMins", "%[1]s Override Duration", "duration", "measurement", "min", "hvac-sensors-z%[2]d-odur", a},
+		{ "%[4]s/zone/%[2]d/overrideActive", "%[1]s Override Active", "", "", "", "hvac-sensors-z%[2]d-tovr", a},
+		{ "%[4]s/zone/%[2]d/overrideDurationMins", "%[1]s Override duration", "duration", "measurement", "min", "hvac-sensors-z%[2]d-odur", a},
 		{ "%[4]s/zone/%[2]d/temp16", "%[1]s Raw Temperature", "temperature", "measurement", "°F", "hvac-sensors-z%[2]d-t16", a},
+	}
+	numbers := []discoveryTopicNumber {
+		{ "%[4]s/zone/%[2]d/overrideDurationMins", "%[4]s/zone/%[2]d/overrideDurationMins/set", "%[1]s Set override duration", "box", 0, 1439, 15, "min", "hvac-numbers-z%[2]d-sodur", a},
 	}
 	tempu := "F"
 	if tu > 0 { tempu = "C" }
@@ -370,6 +393,24 @@ func mqttDiscoverZone(zi int, zn string, tu uint8) {
 		log.Infof("MQTT ZONE SENSOR DISC: %v", j)
 		if err == nil {
 			_ = mqttClient.Publish("homeassistant/sensor/infinitive/" + v.Unique_id + "/config", 0, true, j)
+		}
+	}
+
+	// write discovery topics for per-zone numbers
+	for _, v := range numbers {
+		v.StateTopic = fmt.Sprintf(v.StateTopic, zn, zi+1, tempu, instanceName)
+		v.CommandTopic = fmt.Sprintf(v.CommandTopic, zn, zi+1, tempu, instanceName)
+		v.Name = fmt.Sprintf(v.Name, zn, zi+1, tempu, instanceName)
+		v.Unique_id = fmt.Sprintf(v.Unique_id, zn, zi+1, tempu, instanceName)
+
+		if instanceName != "infinitive" {
+			v.Unique_id =  instanceName + "-" + v.Unique_id
+		}
+
+		j, err := json.Marshal(&v)
+		log.Infof("MQTT ZONE NUMBER DISC: %v", j)
+		if err == nil {
+			_ = mqttClient.Publish("homeassistant/number/infinitive/" + v.Unique_id + "/config", 0, true, j)
 		}
 	}
 
