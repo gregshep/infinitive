@@ -80,12 +80,12 @@ func serializeEvent(source string, data interface{}) []byte {
 }
 
 func (d *EventDispatcher) broadcastEvent(source string, data interface{}) {
-	if len(source) > 6 && source[0:6] == "local/" {
+	if len(source) >= 6 && source[0:6] == "local/" {
 		// local events don't broadcast anywhere
 		topic := source[6:]
 		value := fmt.Sprintf("%v", data)
 		log.Infof("LOCAL: %s -> %s", topic, value)
-	} else if source[0:5] == "mqtt/" {
+	} else if len(source) >= 5 && source[0:5] == "mqtt/" {
 		if mqttClient != nil {
 			topic := source[5:]
 			value := fmt.Sprintf("%v", data)
@@ -162,7 +162,13 @@ func ConnectMqtt(url string, password string) {
 	co.SetPassword(password)
 	co.SetClientID(instanceName + "_mqtt_client")
 	co.SetOnConnectHandler(mqttOnConnect)
-	co.SetConnectionLostHandler(func(cl mqtt.Client, err error) {log.Info("MQTT: Connection lost: ", err.Error())})
+	co.SetConnectionLostHandler(func(cl mqtt.Client, err error) {
+		if err != nil {
+			log.Info("MQTT: Connection lost: ", err.Error())
+		} else {
+			log.Info("MQTT: Connection lost")
+		}
+	})
 	co.SetReconnectingHandler(func(cl mqtt.Client, _ *mqtt.ClientOptions) {log.Info("MQTT: Trying to reconnect")})
 	co.SetConnectRetry(true)
 	co.SetConnectRetryInterval(time.Minute)
@@ -314,7 +320,7 @@ func mqttOnConnect(cl mqtt.Client) {
 // post discovery message if needed
 func mqttDiscoverZone(zi int, zn string, tu uint8) {
 
-	if mqttZoneFlags[zi] || !mqttClient.IsConnected() {
+	if mqttClient == nil || mqttZoneFlags[zi] || !mqttClient.IsConnected() {
 		return
 	}
 
