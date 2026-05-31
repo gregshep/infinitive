@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"time"
 	"fmt"
+	"sync"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tarm/serial"
@@ -18,6 +19,12 @@ const (
 
 var responseTimeout = 1200
 var responseRetries = 0
+
+const (
+	busQuietFailureThreshold = 5
+	busQuietFailureWindow    = 5 * time.Second
+	busQuietCleanWindow      = 30 * time.Second
+)
 
 type snoopCallback func(*InfinityFrame)
 
@@ -62,6 +69,11 @@ type InfinityProtocol struct {
 	snoops     []InfinityProtocolSnoop
 	statTime   int64		// time stats cleared (unix ms
 	stats	   *protocolStats
+
+	busQuietMu       sync.Mutex
+	busQuietFailures []time.Time
+	busQuietUntil    time.Time
+	busQuietLogged   bool
 }
 
 func fixedASCII(s string, size int) []byte {
@@ -169,6 +181,56 @@ func (p *InfinityProtocol) Open() error {
 	go p.broker()
 
 	return nil
+}
+
+func (p *InfinityProtocol) recordDecodeFailure() {
+	now := time.Now()
+	cutoff := now.Add(-busQuietFailureWindow)
+
+	p.busQuietMu.Lock()
+	defer p.busQuietMu.Unlock()
+
+	if now.Before(p.busQuietUntil) {
+		p.busQuietUntil = now.Add(busQuietCleanWindow)
+		p.busQuietLogged = false
+		return
+	}
+
+	kept := p.busQuietFailures[:0]
+	for _, t := range p.busQuietFailures {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	p.busQuietFailures = append(kept, now)
+
+	if len(p.busQuietFailures) >= busQuietFailureThreshold {
+		wasQuiet := now.Before(p.busQuietUntil)
+		p.busQuietUntil = now.Add(busQuietCleanWindow)
+		p.busQuietLogged = false
+		if !wasQuiet {
+			log.Warnf("entering bus quiet mode after %d decode failures in %s; suppressing Infinitive/SAM traffic until %s after a clean bus",
+				len(p.busQuietFailures), busQuietFailureWindow, busQuietCleanWindow)
+		}
+	}
+}
+
+func (p *InfinityProtocol) busQuietActive() bool {
+	now := time.Now()
+
+	p.busQuietMu.Lock()
+	defer p.busQuietMu.Unlock()
+
+	if now.Before(p.busQuietUntil) {
+		return true
+	}
+
+	if !p.busQuietUntil.IsZero() && !p.busQuietLogged {
+		log.Infof("leaving bus quiet mode after %s without decode failures", busQuietCleanWindow)
+		p.busQuietLogged = true
+		p.busQuietFailures = nil
+	}
+	return false
 }
 
 func (p *InfinityProtocol) handleFrame(frame *InfinityFrame) *InfinityFrame {
@@ -292,8 +354,12 @@ func (p *InfinityProtocol) reader() {
 				p.stats.frames++
 				response := p.handleFrame(frame)
 				if response != nil {
-					p.stats.sresp++
-					p.sendFrame(response.encode())
+					if p.busQuietActive() {
+						log.Debugf("suppressing SAM response to %04x during bus quiet mode", response.dst)
+					} else {
+						p.stats.sresp++
+						p.sendFrame(response.encode())
+					}
 				}
 				// Intentionally didn't do msg = msg[l:] to avoid potential
 				// memory leak.  Not sure if it makes a difference...
@@ -301,6 +367,7 @@ func (p *InfinityProtocol) reader() {
 			} else {
 				busCapture.LogFrame("rx", buf, nil, false, "decode failed")
 				p.stats.frerrs++
+				p.recordDecodeFailure()
 				if log.IsLevelEnabled(log.DebugLevel) {
 					log.Debugf("serial frame decode failed: len=%d raw=%s", len(buf), hex.EncodeToString(buf))
 				}
@@ -338,6 +405,10 @@ func (p *InfinityProtocol) performAction(action *Action) {
 	seq := commandLog.NextSeq()
 
 	for attempt := 0; ; attempt++ {
+		if p.busQuietActive() {
+			commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "bus quiet mode active")
+			goto timedOut
+		}
 		commandLog.Log("tx", seq, attempt, action.requestFrame, encodedFrame, nil, time.Since(stime), "")
 		p.sendFrame(encodedFrame)
 		timer := time.NewTimer(time.Millisecond * time.Duration(responseTimeout))
@@ -512,6 +583,11 @@ func logBusCapture(direction string, buf []byte, note string) {
 }
 
 func (p *InfinityProtocol) sendFrame(buf []byte) bool {
+	if p.busQuietActive() {
+		logBusCapture("tx_suppressed", buf, "bus quiet mode active")
+		return false
+	}
+
 	logBusCapture("tx", buf, "")
 
 	// Ensure we're not in the middle of reopening the serial port due to an error.
