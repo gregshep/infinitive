@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -24,6 +25,13 @@ const (
 	busQuietFailureThreshold = 5
 	busQuietFailureWindow    = 5 * time.Second
 	busQuietCleanWindow      = 30 * time.Second
+	busQuietTimeoutThreshold = 2
+	busQuietTimeoutWindow    = 60 * time.Second
+	busIdleBeforeTx          = 50 * time.Millisecond
+	busIdleMaxWait           = 250 * time.Millisecond
+	busTxJitterMax           = 75 * time.Millisecond
+	busSlowStartWindow       = 60 * time.Second
+	busSlowStartMinSpacing   = 15 * time.Second
 )
 
 type snoopCallback func(*InfinityFrame)
@@ -39,26 +47,26 @@ type InfinityProtocolSnoop struct {
 }
 
 type protocolStats struct {
-	rcvs	int64	// candidate frames received
-	frerrs	int64	// framing errors
-	frames	int64	// valid frames received
-	fself	int64	// frames addressed to me
-	fother	int64	// frames addressed to others
-	fsnoop	int64	// frames addressed to others, snooped
+	rcvs   int64 // candidate frames received
+	frerrs int64 // framing errors
+	frames int64 // valid frames received
+	fself  int64 // frames addressed to me
+	fother int64 // frames addressed to others
+	fsnoop int64 // frames addressed to others, snooped
 
-	sresp	int64	// response msgs ordered
-	srd	int64	// action (originated) msgs ordered
-	srdt	int64	// action (originated) msgs ordered
-	swr	int64	// action (originated) msgs ordered
+	sresp int64 // response msgs ordered
+	srd   int64 // action (originated) msgs ordered
+	srdt  int64 // action (originated) msgs ordered
+	swr   int64 // action (originated) msgs ordered
 
-	aact	int64	// actions originated
-	aretr	int64	// actions retransmitted
-	aother	int64	// something other than expected response when resp expected
-	aok1	int64	// actions processed OK w/o retrans
-	aokN	int64	// actions processed OK a retrans
-	aokms	int64	// total milliseconds of elapsed time for successful transactions (aok1 + aokN)
-	afail	int64	// actions failed
-	afailms	int64	// total milliseconds of elapsed time for failed transactions (afail)
+	aact    int64 // actions originated
+	aretr   int64 // actions retransmitted
+	aother  int64 // something other than expected response when resp expected
+	aok1    int64 // actions processed OK w/o retrans
+	aokN    int64 // actions processed OK a retrans
+	aokms   int64 // total milliseconds of elapsed time for successful transactions (aok1 + aokN)
+	afail   int64 // actions failed
+	afailms int64 // total milliseconds of elapsed time for failed transactions (afail)
 }
 
 type InfinityProtocol struct {
@@ -67,13 +75,18 @@ type InfinityProtocol struct {
 	responseCh chan *InfinityFrame
 	actionCh   chan *Action
 	snoops     []InfinityProtocolSnoop
-	statTime   int64		// time stats cleared (unix ms
-	stats	   *protocolStats
+	statTime   int64 // time stats cleared (unix ms
+	stats      *protocolStats
 
-	busQuietMu       sync.Mutex
-	busQuietFailures []time.Time
-	busQuietUntil    time.Time
-	busQuietLogged   bool
+	busQuietMu         sync.Mutex
+	busQuietFailures   []time.Time
+	busQuietTimeouts   []time.Time
+	busQuietUntil      time.Time
+	busQuietLogged     bool
+	busQuietReason     string
+	busSlowStartUntil  time.Time
+	busSlowStartLastTx time.Time
+	lastRx             time.Time
 }
 
 func fixedASCII(s string, size int) []byte {
@@ -193,6 +206,7 @@ func (p *InfinityProtocol) recordDecodeFailure() {
 	if now.Before(p.busQuietUntil) {
 		p.busQuietUntil = now.Add(busQuietCleanWindow)
 		p.busQuietLogged = false
+		busCapture.LogEvent("bus_quiet_extend", "decode failure while quiet", p.busQuietReason, p.busQuietUntil, 0, 0)
 		return
 	}
 
@@ -205,32 +219,155 @@ func (p *InfinityProtocol) recordDecodeFailure() {
 	p.busQuietFailures = append(kept, now)
 
 	if len(p.busQuietFailures) >= busQuietFailureThreshold {
-		wasQuiet := now.Before(p.busQuietUntil)
-		p.busQuietUntil = now.Add(busQuietCleanWindow)
-		p.busQuietLogged = false
-		if !wasQuiet {
-			log.Warnf("entering bus quiet mode after %d decode failures in %s; suppressing Infinitive/SAM traffic until %s after a clean bus",
-				len(p.busQuietFailures), busQuietFailureWindow, busQuietCleanWindow)
-		}
+		p.enterBusQuietLocked("decode failures", now.Add(busQuietCleanWindow), len(p.busQuietFailures))
 	}
 }
 
+func (p *InfinityProtocol) recordActionTimeout() {
+	now := time.Now()
+	cutoff := now.Add(-busQuietTimeoutWindow)
+
+	p.busQuietMu.Lock()
+	defer p.busQuietMu.Unlock()
+
+	kept := p.busQuietTimeouts[:0]
+	for _, t := range p.busQuietTimeouts {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	p.busQuietTimeouts = append(kept, now)
+
+	if len(p.busQuietTimeouts) >= busQuietTimeoutThreshold {
+		p.enterBusQuietLocked("action timeouts", now.Add(busQuietCleanWindow), len(p.busQuietTimeouts))
+	}
+}
+
+func (p *InfinityProtocol) enterBusQuietLocked(reason string, until time.Time, count int) {
+	now := time.Now()
+	wasQuiet := now.Before(p.busQuietUntil)
+	if until.After(p.busQuietUntil) {
+		p.busQuietUntil = until
+	}
+	p.busQuietReason = reason
+	p.busQuietLogged = false
+
+	if wasQuiet {
+		busCapture.LogEvent("bus_quiet_extend", "bus quiet mode extended", reason, p.busQuietUntil, count, 0)
+		return
+	}
+
+	log.Warnf("entering bus quiet mode after %d %s; suppressing Infinitive/SAM traffic until %s after a clean bus",
+		count, reason, busQuietCleanWindow)
+	busCapture.LogEvent("bus_quiet_enter", "suppressing Infinitive/SAM traffic", reason, p.busQuietUntil, count, 0)
+}
+
 func (p *InfinityProtocol) busQuietActive() bool {
+	active, _, _ := p.busQuietState()
+	return active
+}
+
+func (p *InfinityProtocol) busQuietState() (bool, time.Time, string) {
 	now := time.Now()
 
 	p.busQuietMu.Lock()
 	defer p.busQuietMu.Unlock()
 
 	if now.Before(p.busQuietUntil) {
-		return true
+		return true, p.busQuietUntil, p.busQuietReason
 	}
 
 	if !p.busQuietUntil.IsZero() && !p.busQuietLogged {
-		log.Infof("leaving bus quiet mode after %s without decode failures", busQuietCleanWindow)
+		reason := p.busQuietReason
+		p.busSlowStartUntil = now.Add(busSlowStartWindow)
+		p.busSlowStartLastTx = time.Time{}
+		log.Infof("leaving bus quiet mode after %s without decode failures; slow-starting Infinitive traffic for %s",
+			busQuietCleanWindow, busSlowStartWindow)
+		busCapture.LogEvent("bus_quiet_exit", "bus clean window elapsed; entering slow start", reason, p.busSlowStartUntil, 0, 0)
 		p.busQuietLogged = true
 		p.busQuietFailures = nil
+		p.busQuietTimeouts = nil
+		p.busQuietReason = ""
+	}
+	return false, time.Time{}, ""
+}
+
+func (p *InfinityProtocol) busSlowStartDelay() time.Duration {
+	now := time.Now()
+
+	p.busQuietMu.Lock()
+	defer p.busQuietMu.Unlock()
+
+	if p.busSlowStartUntil.IsZero() || now.After(p.busSlowStartUntil) {
+		p.busSlowStartUntil = time.Time{}
+		p.busSlowStartLastTx = time.Time{}
+		return 0
+	}
+
+	if p.busSlowStartLastTx.IsZero() {
+		p.busSlowStartLastTx = now
+		return 0
+	}
+
+	next := p.busSlowStartLastTx.Add(busSlowStartMinSpacing)
+	if now.Before(next) {
+		return next.Sub(now)
+	}
+
+	p.busSlowStartLastTx = now
+	return 0
+}
+
+func (p *InfinityProtocol) recentDecodeFailure() bool {
+	now := time.Now()
+	cutoff := now.Add(-busQuietCleanWindow)
+
+	p.busQuietMu.Lock()
+	defer p.busQuietMu.Unlock()
+
+	for _, t := range p.busQuietFailures {
+		if t.After(cutoff) {
+			return true
+		}
 	}
 	return false
+}
+
+func (p *InfinityProtocol) recordRxActivity() {
+	now := time.Now()
+
+	p.busQuietMu.Lock()
+	p.lastRx = now
+	p.busQuietMu.Unlock()
+}
+
+func (p *InfinityProtocol) waitForBusIdle() (bool, time.Duration) {
+	deadline := time.Now().Add(busIdleMaxWait)
+
+	for {
+		p.busQuietMu.Lock()
+		lastRx := p.lastRx
+		p.busQuietMu.Unlock()
+
+		if lastRx.IsZero() {
+			return true, 0
+		}
+
+		idle := time.Since(lastRx)
+		if idle >= busIdleBeforeTx {
+			return true, idle
+		}
+
+		if time.Now().After(deadline) {
+			return false, idle
+		}
+
+		sleepFor := busIdleBeforeTx - idle
+		if sleepFor > 10*time.Millisecond {
+			sleepFor = 10 * time.Millisecond
+		}
+		time.Sleep(sleepFor)
+	}
 }
 
 func (p *InfinityProtocol) handleFrame(frame *InfinityFrame) *InfinityFrame {
@@ -317,6 +454,7 @@ func (p *InfinityProtocol) reader() {
 		}
 
 		p.stats.rcvs++
+		p.recordRxActivity()
 
 		// log.Printf("%q", buf[:n])
 		busCapture.LogRaw("rx_raw", buf[:n], "serial read")
@@ -354,8 +492,9 @@ func (p *InfinityProtocol) reader() {
 				p.stats.frames++
 				response := p.handleFrame(frame)
 				if response != nil {
-					if p.busQuietActive() {
+					if active, until, reason := p.busQuietState(); active {
 						log.Debugf("suppressing SAM response to %04x during bus quiet mode", response.dst)
+						logBusCapture("tx_suppressed", response.encode(), fmt.Sprintf("bus quiet mode active: %s until %s", reason, until.Format(time.RFC3339Nano)))
 					} else {
 						p.stats.sresp++
 						p.sendFrame(response.encode())
@@ -405,12 +544,16 @@ func (p *InfinityProtocol) performAction(action *Action) {
 	seq := commandLog.NextSeq()
 
 	for attempt := 0; ; attempt++ {
-		if p.busQuietActive() {
-			commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "bus quiet mode active")
+		if active, until, reason := p.busQuietState(); active {
+			commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime),
+				fmt.Sprintf("bus quiet mode active: %s until %s", reason, until.Format(time.RFC3339Nano)))
 			goto timedOut
 		}
 		commandLog.Log("tx", seq, attempt, action.requestFrame, encodedFrame, nil, time.Since(stime), "")
-		p.sendFrame(encodedFrame)
+		if !p.sendActionFrame(encodedFrame) {
+			commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "transmit suppressed")
+			goto timedOut
+		}
 		timer := time.NewTimer(time.Millisecond * time.Duration(responseTimeout))
 
 		for {
@@ -455,7 +598,11 @@ func (p *InfinityProtocol) performAction(action *Action) {
 					default:
 					}
 				}
-				if attempt == 0 { p.stats.aok1++ } else {p.stats.aokN++ }
+				if attempt == 0 {
+					p.stats.aok1++
+				} else {
+					p.stats.aokN++
+				}
 				p.stats.aokms = p.stats.aokms + time.Since(stime).Milliseconds()
 
 				action.responseFrame = res
@@ -468,6 +615,12 @@ func (p *InfinityProtocol) performAction(action *Action) {
 			case <-timer.C:
 				if attempt >= responseRetries {
 					commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "no matching response")
+					p.recordActionTimeout()
+					goto timedOut
+				}
+				if p.busQuietActive() || p.recentDecodeFailure() {
+					commandLog.Log("timeout", seq, attempt, action.requestFrame, nil, nil, time.Since(stime), "retry suppressed by bus health")
+					p.recordActionTimeout()
 					goto timedOut
 				}
 				log.Debug("timeout waiting for response, retransmitting frame")
@@ -476,7 +629,7 @@ func (p *InfinityProtocol) performAction(action *Action) {
 				goto retry
 			}
 		}
-retry:
+	retry:
 	}
 
 timedOut:
@@ -583,9 +736,55 @@ func logBusCapture(direction string, buf []byte, note string) {
 }
 
 func (p *InfinityProtocol) sendFrame(buf []byte) bool {
-	if p.busQuietActive() {
-		logBusCapture("tx_suppressed", buf, "bus quiet mode active")
+	if active, until, reason := p.busQuietState(); active {
+		logBusCapture("tx_suppressed", buf, fmt.Sprintf("bus quiet mode active: %s until %s", reason, until.Format(time.RFC3339Nano)))
 		return false
+	}
+
+	logBusCapture("tx", buf, "")
+
+	// Ensure we're not in the middle of reopening the serial port due to an error.
+	if p.port == nil {
+		return false
+	}
+
+	// log.Debugf("transmitting frame: %x", buf)
+	_, err := p.port.Write(buf)
+	if err != nil {
+		logBusCapture("tx", buf, fmt.Sprintf("serial write failed: %s", err.Error()))
+		log.Errorf("error writing to serial: %s", err.Error())
+		p.port.Close()
+		p.port = nil
+		return false
+	}
+	return true
+}
+
+func (p *InfinityProtocol) sendActionFrame(buf []byte) bool {
+	if active, until, reason := p.busQuietState(); active {
+		logBusCapture("tx_suppressed", buf, fmt.Sprintf("bus quiet mode active: %s until %s", reason, until.Format(time.RFC3339Nano)))
+		return false
+	}
+
+	if delay := p.busSlowStartDelay(); delay > 0 {
+		note := fmt.Sprintf("bus slow start suppressed tx: retry_after=%s", delay)
+		logBusCapture("tx_suppressed", buf, note)
+		busCapture.LogEvent("bus_tx_suppressed", note, "bus slow start", time.Time{}, 0, delay)
+		return false
+	}
+
+	if ok, idleFor := p.waitForBusIdle(); !ok {
+		note := fmt.Sprintf("bus idle guard suppressed tx: idle_for=%s required=%s max_wait=%s", idleFor, busIdleBeforeTx, busIdleMaxWait)
+		logBusCapture("tx_suppressed", buf, note)
+		busCapture.LogEvent("bus_tx_suppressed", note, "bus not idle", time.Time{}, 0, idleFor)
+		return false
+	}
+
+	if busTxJitterMax > 0 {
+		delay := time.Duration(rand.Int63n(int64(busTxJitterMax)))
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 	}
 
 	logBusCapture("tx", buf, "")

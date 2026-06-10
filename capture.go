@@ -31,8 +31,13 @@ type busCaptureRecord struct {
 	Direction string `json:"dir"`
 	RawHex    string `json:"raw_hex"`
 
-	Valid *bool `json:"valid,omitempty"`
-	Note  string `json:"note,omitempty"`
+	Valid        *bool  `json:"valid,omitempty"`
+	Note         string `json:"note,omitempty"`
+	Event        string `json:"event,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	QuietUntil   string `json:"quiet_until,omitempty"`
+	FailureCount int    `json:"failure_count,omitempty"`
+	DelayMs      int64  `json:"delay_ms,omitempty"`
 
 	Src     uint16 `json:"src,omitempty"`
 	SrcHex  string `json:"src_hex,omitempty"`
@@ -153,6 +158,26 @@ func (c *BusCapture) LogRaw(direction string, raw []byte, note string) {
 		Direction: direction,
 		RawHex:    hex.EncodeToString(raw),
 		Note:      note,
+	}
+
+	c.logRecord(rec)
+}
+
+func (c *BusCapture) LogEvent(event string, note string, reason string, quietUntil time.Time, failureCount int, delay time.Duration) {
+	rec := busCaptureRecord{
+		Timestamp:    time.Now().Format(time.RFC3339Nano),
+		UnixMs:       time.Now().UnixMilli(),
+		Direction:    "event",
+		Event:        event,
+		Note:         note,
+		Reason:       reason,
+		FailureCount: failureCount,
+	}
+	if !quietUntil.IsZero() {
+		rec.QuietUntil = quietUntil.Format(time.RFC3339Nano)
+	}
+	if delay > 0 {
+		rec.DelayMs = delay.Milliseconds()
 	}
 
 	c.logRecord(rec)
