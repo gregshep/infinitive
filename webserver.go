@@ -197,6 +197,61 @@ func webserver(port int) {
 		}
 	})
 
+	// PUT /api/raw/:device/:table — write arbitrary bytes to a table on a device.
+	// Body: hex-encoded bytes for the 3-byte addr prefix (zflag + 2-byte flags)
+	// followed by the struct payload. Useful for reverse-engineering newer
+	// firmware tables. Returns 200 if the device ACKed the WRITE, 504 on timeout.
+	api.PUT("/raw/:device/:table", func(c *gin.Context) {
+		matched, _ := regexp.MatchString("^[a-f0-9]{4}$", c.Param("device"))
+		if !matched {
+			c.AbortWithError(400, errors.New("device must be a 4 character hex string"))
+			return
+		}
+		matched, _ = regexp.MatchString("^[a-f0-9]{6}$", c.Param("table"))
+		if !matched {
+			c.AbortWithError(400, errors.New("table must be a 6 character hex string"))
+			return
+		}
+
+		body, err := c.GetRawData()
+		if err != nil {
+			c.AbortWithError(400, err)
+			return
+		}
+		// Trim whitespace including newlines
+		bodyStr := string(body)
+		clean := make([]byte, 0, len(bodyStr))
+		for i := 0; i < len(bodyStr); i++ {
+			b := bodyStr[i]
+			if b != ' ' && b != '\n' && b != '\r' && b != '\t' {
+				clean = append(clean, b)
+			}
+		}
+		payload, err := hex.DecodeString(string(clean))
+		if err != nil {
+			c.AbortWithError(400, errors.New("body must be a hex string (whitespace ignored)"))
+			return
+		}
+		if len(payload) < 3 {
+			c.AbortWithError(400, errors.New("body must include the 3-byte addr prefix (zflag + 2-byte flags) and at least 0 struct bytes"))
+			return
+		}
+
+		d, _ := strconv.ParseUint(c.Param("device"), 16, 16)
+		tbl, _ := hex.DecodeString(c.Param("table"))
+		addrPrefix := payload[0:3]
+		structBytes := payload[3:]
+
+		log.Infof("raw write: dst=%04x table=%02x%02x%02x addrPrefix=%x struct=%x", d, tbl[0], tbl[1], tbl[2], addrPrefix, structBytes)
+		success := infinity.Write(uint16(d), tbl, addrPrefix, structBytes)
+
+		if success {
+			c.JSON(200, gin.H{"status": "ok"})
+		} else {
+			c.AbortWithError(504, errors.New("timed out waiting for response"))
+		}
+	})
+
 	api.GET("/ws", func(c *gin.Context) {
 		h := websocket.Handler(attachListener)
 		h.ServeHTTP(c.Writer, c.Request)
