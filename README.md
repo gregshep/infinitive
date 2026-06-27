@@ -45,10 +45,12 @@ on a single-zone heat-pump system.
 
 ## Branch layout
 
-- **`add-raw-write`** — current working branch; carries the touch-thermostat
-  PRs from madbrain plus the additions above. This is what you want to deploy.
-- **`feature-touch-thermostat`** — older, kept for diff convenience against madbrain.
-- **`master`** — tracks `madbrain76/master`.
+- **`master`** — default branch. Carries madbrain's touch-thermostat PRs +
+  the additions described above. This is what you want to build and deploy.
+- **`feature-touch-thermostat`** — older snapshot, kept as a diff reference
+  against madbrain's original.
+- **`add-raw-write`** — historical working branch that became `master`.
+  Retained until upstream conversation lands; will be deleted after that.
 
 ## Status
 
