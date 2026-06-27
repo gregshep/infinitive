@@ -1338,16 +1338,51 @@ func statsPoller() {
 }
 
 func attachSnoops() {
-	// Snoop thermostat broadcasts.  Newer systems publish outdoor temp here
-	// while legacy thermostat status tables remain zero.
+	// Snoop thermostat broadcasts. On Touch firmwares the legacy zone-state
+	// tables (0x003b02, 0x003b03, 0x003d02) return all zeros to READs, so we
+	// extract live state from the thermostat's outbound WRITEs to peripherals
+	// instead. Verified by correlating captures/changes-capture.jsonl bytes
+	// against known thermostat readings (77.0°F, 44%) on 2026-06-27.
 	infinity.snoopResponse(0x2001, 0x2001, func(frame *InfinityFrame) {
-		if frame.op != opWRITE || len(frame.data) < 13 || !bytes.Equal(frame.data[0:3], []byte{0x00, 0x04, 0x20}) {
+		// Legacy: outdoor-temp broadcast via WRITE on 0x000420
+		if frame.op == opWRITE && len(frame.data) >= 13 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x04, 0x20}) {
+			data := frame.data[3:]
+			outdoorTemp := uint8((binary.BigEndian.Uint16(data[6:8]) + 8) / 16)
+			updateRuntimeOutdoorTemp(outdoorTemp)
+			log.Debugf("thermostat broadcast outdoor temp=%d raw=%x", outdoorTemp, data)
 			return
 		}
-		data := frame.data[3:]
-		outdoorTemp := uint8((binary.BigEndian.Uint16(data[6:8]) + 8) / 16)
-		updateRuntimeOutdoorTemp(outdoorTemp)
-		log.Debugf("thermostat broadcast outdoor temp=%d raw=%x", outdoorTemp, data)
+		// Touch: currentTemp broadcast every ~20s via WRITE on 0x00060b to
+		// the heat pump. Payload byte 0 is a constant 0x01 (zone marker?);
+		// bytes 1-2 are uint16 BE / 16 = °F. Same encoding as the existing
+		// heat-pump CoilTemp decoder.
+		if frame.op == opWRITE && len(frame.data) >= 6 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x06, 0x0b}) {
+			data := frame.data[3:]
+			temp := uint8(binary.BigEndian.Uint16(data[1:3]) / 16)
+			if plausibleRuntimeTemp(temp) {
+				updateRuntimeZone(0, temp, 0, 0, 0)
+				markTouchThermostatDetected()
+				log.Debugf("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
+			}
+			return
+		}
+		// Touch: combined broadcast every ~30s via WRITE on 0x000716.
+		// Layout (after 3-byte table header):
+		//   byte 4-5: outdoor/coil temp uint16 BE / 16 (zero if no reading)
+		//   byte 6:   currentHumidity %  (zero if no reading)
+		//   byte 8-9: currentTemp uint16 BE / 16 (always present)
+		// We only consume humidity here; currentTemp is already covered by
+		// the 0x00060b path above with higher cadence.
+		if frame.op == opWRITE && len(frame.data) >= 13 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x07, 0x16}) {
+			data := frame.data[3:]
+			humidity := data[6]
+			if plausibleRuntimeHumidity(humidity) {
+				updateRuntimeZone(0, 0, humidity, 0, 0)
+				markTouchThermostatDetected()
+				log.Debugf("touch thermostat 0x000716 currentHumidity=%d%% raw=%x", humidity, data)
+			}
+			return
+		}
 	})
 
 	// Snoop 2026 smart sensor responses.  The legacy thermostat zone tables
