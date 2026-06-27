@@ -1338,35 +1338,16 @@ func statsPoller() {
 }
 
 func attachSnoops() {
-	// Snoop thermostat broadcasts. Two unrelated cases:
-	//   1) Older firmwares publish outdoor temp via WRITE on table 0x000420.
-	//   2) Touch firmwares respond to READs on table 0x00400a with per-zone
-	//      state (current temp in byte 1 of each 7-byte zone block). The
-	//      legacy 0x003b02/0x003b03/0x003d02 tables return all zeros on
-	//      Touch — see captures/commandlog-20260627-115959.jsonl for
-	//      verification (byte 1 = 0x4D matched displayed 77°F).
+	// Snoop thermostat broadcasts.  Newer systems publish outdoor temp here
+	// while legacy thermostat status tables remain zero.
 	infinity.snoopResponse(0x2001, 0x2001, func(frame *InfinityFrame) {
-		// Case 1: outdoor temp broadcast (legacy)
-		if frame.op == opWRITE && len(frame.data) >= 13 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x04, 0x20}) {
-			data := frame.data[3:]
-			outdoorTemp := uint8((binary.BigEndian.Uint16(data[6:8]) + 8) / 16)
-			updateRuntimeOutdoorTemp(outdoorTemp)
-			log.Debugf("thermostat broadcast outdoor temp=%d raw=%x", outdoorTemp, data)
+		if frame.op != opWRITE || len(frame.data) < 13 || !bytes.Equal(frame.data[0:3], []byte{0x00, 0x04, 0x20}) {
 			return
 		}
-		// Case 2: Touch thermostat zone state response.
-		// 0x00400a payload = 5 × 7-byte zone blocks. Single-thermostat
-		// systems replicate the same value across all 5 slots; we only
-		// need slot 0. Byte 1 of the slot = current temp in whole °F.
-		// Other bytes (0, 2-6) decode TBD — humidity + setpoints still
-		// need ground-truth correlation to place.
-		if frame.op == opRESPONSE && len(frame.data) >= 10 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x40, 0x0a}) {
-			data := frame.data[3:]
-			updateRuntimeZone(0, data[1], 0, 0, 0)
-			markTouchThermostatDetected()
-			log.Debugf("touch thermostat 0x400a zone 0 currentTemp=%d raw=%x", data[1], data)
-			return
-		}
+		data := frame.data[3:]
+		outdoorTemp := uint8((binary.BigEndian.Uint16(data[6:8]) + 8) / 16)
+		updateRuntimeOutdoorTemp(outdoorTemp)
+		log.Debugf("thermostat broadcast outdoor temp=%d raw=%x", outdoorTemp, data)
 	})
 
 	// Snoop 2026 smart sensor responses.  The legacy thermostat zone tables
