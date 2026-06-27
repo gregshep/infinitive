@@ -688,17 +688,14 @@ func getZNConfig(zi int) (*TStatZoneConfig, bool) {
 		return nil, false
 	}
 
+	// Same Touch-firmware best-effort treatment as getZonesConfig — don't
+	// return nil when reads time out, fall through and let runtimeZones data
+	// override the zeros below.
 	cfg := TStatZoneParams{}
-	ok := infinity.ReadTable(devTSTAT, &cfg)
-	if !ok {
-		return nil, false
-	}
+	_ = infinity.ReadTable(devTSTAT, &cfg)
 
 	params := TStatCurrentParams{}
-	ok = infinity.ReadTable(devTSTAT, &params)
-	if !ok {
-		return nil, false
-	}
+	_ = infinity.ReadTable(devTSTAT, &params)
 
 	hold := cfg.ZoneHold & (0x01 << zi) != 0
 	overrideActive := cfg.ZOvrdState & (0x01 << zi) != 0
@@ -714,7 +711,7 @@ func getZNConfig(zi int) (*TStatZoneConfig, bool) {
 		overrideDuration = ""
 	}
 
-	return &TStatZoneConfig{
+	out := &TStatZoneConfig{
 		CurrentTemp:     params.ZCurrentTemp[zi],
 		CurrentHumidity: params.ZCurrentHumidity[zi],
 		OutdoorTemp:     params.OutdoorAirTemp,
@@ -732,7 +729,29 @@ func getZNConfig(zi int) (*TStatZoneConfig, bool) {
 		ZoneName:        string(bytes.Trim(cfg.ZName[zi][:], " \000")),
 		TargetHumidity:  cfg.ZTargetHumidity[zi],
 		RawMode:         params.Mode,
-	}, true
+	}
+
+	// Touch firmware: override zeros with snoop-fed runtimeZones data when
+	// the per-table reads above came back empty.
+	runtimeZoneMu.Lock()
+	rz := runtimeZones[zi]
+	runtimeZoneMu.Unlock()
+	if rz.Seen {
+		if out.CurrentTemp == 0 && rz.CurrentTemp > 0 {
+			out.CurrentTemp = rz.CurrentTemp
+		}
+		if out.CurrentHumidity == 0 && rz.CurrentHumidity > 0 {
+			out.CurrentHumidity = rz.CurrentHumidity
+		}
+		if out.HeatSetpoint == 0 && rz.HeatSetpoint > 0 {
+			out.HeatSetpoint = rz.HeatSetpoint
+		}
+		if out.CoolSetpoint == 0 && rz.CoolSetpoint > 0 {
+			out.CoolSetpoint = rz.CoolSetpoint
+		}
+	}
+
+	return out, true
 }
 
 // write a change to a single parameter of a vacation setting
