@@ -1,0 +1,25 @@
+# Bus captures may contain sensitive payloads (e.g., table 0x004608
+# carries Wi-Fi credentials in plain text on Touch thermostats).
+# Keep all capture files local — never commit.
+captures/
+*.jsonl
+
+# Built binary
+/infinitive
+infinitive-*
+
+# Go test/build artifacts
+*.test
+*.out
+coverage.txt
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
