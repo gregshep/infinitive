@@ -1381,7 +1381,7 @@ func attachSnoops() {
 			if plausibleRuntimeTemp(temp) {
 				updateRuntimeZone(0, temp, 0, 0, 0)
 				markTouchThermostatDetected()
-				log.Infof("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
+				log.Debugf("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
 			}
 			return
 		}
@@ -1398,7 +1398,7 @@ func attachSnoops() {
 			if plausibleRuntimeHumidity(humidity) {
 				updateRuntimeZone(0, 0, humidity, 0, 0)
 				markTouchThermostatDetected()
-				log.Infof("touch thermostat 0x000716 currentHumidity=%d%% raw=%x", humidity, data)
+				log.Debugf("touch thermostat 0x000716 currentHumidity=%d%% raw=%x", humidity, data)
 			}
 			return
 		}
