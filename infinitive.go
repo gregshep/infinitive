@@ -1364,7 +1364,7 @@ func attachSnoops() {
 			data := frame.data[3:]
 			updateRuntimeZone(0, data[1], 0, 0, 0)
 			markTouchThermostatDetected()
-			log.Debugf("touch thermostat 0x400a zone 0 currentTemp=%d raw=%x", data[1], data)
+			log.Infof("touch thermostat 0x400a zone 0 currentTemp=%d raw=%x", data[1], data)
 			return
 		}
 	})
