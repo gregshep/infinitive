@@ -429,15 +429,16 @@ var _tstat_settings_loaded bool
 var _empty_zone_warning_logged bool
 
 func getZonesConfig() (*TStatZonesConfig, bool) {
-	// only get the TStatSettings once after startup
+	// Read TStatSettings once after startup. On Touch firmware this can
+	// time out; if it does we keep going with the zero-default TempUnits
+	// rather than bailing the whole getZonesConfig and serving an empty
+	// API response. Will retry on the next call until it succeeds.
 	if !_tstat_settings_loaded {
 		log.Debugf("getZonesConfig: getting TStatSettings to determine temp units")
-		ok := infinity.ReadTable(devTSTAT, &_tstat_settings)
-		if !ok {
-			return nil, false
+		if infinity.ReadTable(devTSTAT, &_tstat_settings) {
+			_tstat_settings_loaded = true
+			log.Debugf("getZonesConfig: got temp units = %d", _tstat_settings.TempUnits)
 		}
-		_tstat_settings_loaded = true
-		log.Debugf("getZonesConfig: got temp units = %d", _tstat_settings.TempUnits)
 	}
 
 	// Touch firmware leaves these tables zero AND READs frequently time out.
