@@ -440,17 +440,16 @@ func getZonesConfig() (*TStatZonesConfig, bool) {
 		log.Debugf("getZonesConfig: got temp units = %d", _tstat_settings.TempUnits)
 	}
 
+	// Touch firmware leaves these tables zero AND READs frequently time out.
+	// Best-effort: read what we can, fall through to runtimeZones below.
+	// If both reads fail we still return a (mostly empty) tstat config plus
+	// whatever the snoop-fed runtimeZones can contribute, instead of an
+	// empty HTTP body which silently breaks downstream consumers.
 	cfg := TStatZoneParams{}
-	ok := infinity.ReadTable(devTSTAT, &cfg)
-	if !ok {
-		return nil, false
-	}
+	_ = infinity.ReadTable(devTSTAT, &cfg)
 
 	params := TStatCurrentParams{}
-	ok = infinity.ReadTable(devTSTAT, &params)
-	if !ok {
-		return nil, false
-	}
+	_ = infinity.ReadTable(devTSTAT, &params)
 
 	tstat := TStatZonesConfig{
 		OutdoorTemp:       params.OutdoorAirTemp,
@@ -1362,7 +1361,7 @@ func attachSnoops() {
 			if plausibleRuntimeTemp(temp) {
 				updateRuntimeZone(0, temp, 0, 0, 0)
 				markTouchThermostatDetected()
-				log.Debugf("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
+				log.Infof("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
 			}
 			return
 		}
@@ -1379,7 +1378,7 @@ func attachSnoops() {
 			if plausibleRuntimeHumidity(humidity) {
 				updateRuntimeZone(0, 0, humidity, 0, 0)
 				markTouchThermostatDetected()
-				log.Debugf("touch thermostat 0x000716 currentHumidity=%d%% raw=%x", humidity, data)
+				log.Infof("touch thermostat 0x000716 currentHumidity=%d%% raw=%x", humidity, data)
 			}
 			return
 		}
