@@ -1,3 +1,65 @@
+# gregshep/infinitive — Touch-thermostat additions
+
+This is a fork of [madbrain76/infinitive](https://github.com/madbrain76/infinitive),
+which is itself a fork of [lurgh/infinitive](https://github.com/lurgh/infinitive),
+which originated as [acd/infinitive](https://github.com/acd/infinitive).
+Lineage: **acd → lurgh → madbrain76 → gregshep**.
+
+It carries madbrain76's still-open touch-thermostat PRs against lurgh upstream:
+
+- [lurgh#21 — Feature touch thermostat (fixes #14)](https://github.com/lurgh/infinitive/pull/21)
+- [lurgh#22 — Feature touch thermostat additional sensors](https://github.com/lurgh/infinitive/pull/22)
+
+…plus additional decoders verified against a 2026 Bryant Evolution Touch thermostat
+on a single-zone heat-pump system.
+
+## What this fork adds beyond madbrain's PRs
+
+- **`currentTemp` decoder** (table `0x00060b`, payload bytes 1-2 = `uint16` BE / 16 °F).
+  Touch firmware broadcasts current zone temperature about every 20 s via WRITE
+  to the heat pump (`0x2001 → 0x5601`); always populated.
+- **`currentHumidity` decoder** (table `0x000716`, payload byte 6 = `uint8` percent).
+  Same source, every ~30 s; sparsely populated (the thermostat sends frequent
+  "no reading" frames with byte = 0 between real updates).
+- **Best-effort `ReadTable`** in `getZonesConfig` / `getZNConfig` so the HTTP API
+  surfaces snoop-fed `runtimeZones` data rather than empty bodies when the legacy
+  zone-state reads time out (which is most of the time on Touch).
+- **`runtimeZones` override in `getZNConfig`** mirroring the existing
+  `appendRuntimeZones` fallback in `getZonesConfig`.
+
+## What did NOT work on Touch firmware (documented so others don't repeat)
+
+- Tables **`0x003b02`**, **`0x003b03`**, **`0x003d02`** (the documented zone-state
+  tables) all ACK with all-zero payloads on Touch. They're not usable; reads
+  succeed-with-empty rather than fail outright.
+- **Cool / heat setpoints are not on the bus** on Touch firmware. Verified by
+  capturing the bus during deliberate setpoint nudges (77 → 79 → 77) with a
+  timestamped state-change log; no byte flipped at the nudge timestamps. The
+  displayed setpoint lives only inside the thermostat. The existing
+  `comfortProfile*` MQTT topics published by `publishZoneProgram` are the only
+  setpoint source for this firmware.
+- The `/api/zone/N/config` endpoint was returning empty HTTP bodies *not* because
+  of decoder bugs but because both `ReadTable` calls inside `getZonesConfig`
+  (and a third for `TStatSettings`) were bailing on timeout before reaching the
+  `runtimeZones` fallback path.
+
+## Branch layout
+
+- **`add-raw-write`** — current working branch; carries the touch-thermostat
+  PRs from madbrain plus the additions above. This is what you want to deploy.
+- **`feature-touch-thermostat`** — older, kept for diff convenience against madbrain.
+- **`master`** — tracks `madbrain76/master`.
+
+## Status
+
+Open question with the upstream maintainers about whether/how to land this in
+[lurgh/infinitive#21](https://github.com/lurgh/infinitive/pull/21).
+Until then, this fork is the canonical source for the touch-thermostat decoders.
+
+---
+
+# Inherited README (lurgh/infinitive — describes the underlying tool)
+
 # THIS FORK IS A WORK IN PROGRESS
 
 This fork of infinitive has added read/write API and UI for multi-zone Infinity systems, and support for status
@@ -235,8 +297,8 @@ legacy 'Action' fields in the zone data reports which are calculated differently
 If you'd like to build Infinitive from source, first confirm you have a working Go environment - current minimum version is 1.21.  Ensure your GOPATH and GOHOME are set correctly, then:
 
 ```
-$ go get github.com/lurgh/infinitive
-$ go build github.com/lurgh/infinitive
+$ go get github.com/gregshep/infinitive
+$ go build github.com/gregshep/infinitive
 ```
 
 Alternatively you can clone the github repo and type "make".
