@@ -16,9 +16,9 @@ import (
 )
 
 type TStatZoneConfig struct {
-	ZoneNumber      uint8  `json:"zoneNumber,omitempty"`
-	CurrentTemp     uint8  `json:"currentTemp"`
-	CurrentHumidity uint8  `json:"currentHumidity"`
+	ZoneNumber      uint8   `json:"zoneNumber,omitempty"`
+	CurrentTemp     float32 `json:"currentTemp"`
+	CurrentHumidity uint8   `json:"currentHumidity"`
 	TargetHumidity  uint8  `json:"targetHumidity"`
 	ZoneName	string `json:"zoneName"`
 	FanMode         string `json:"fanMode"`
@@ -84,7 +84,7 @@ var zoneWeight [8]float32
 
 type runtimeZone struct {
 	Seen            bool
-	CurrentTemp     uint8
+	CurrentTemp     float32
 	CurrentHumidity uint8
 	HeatSetpoint    uint8
 	CoolSetpoint    uint8
@@ -99,7 +99,7 @@ var modeWriteNotify bool
 var touchOffCommand bool
 var touchThermostatDetected bool
 
-func plausibleRuntimeTemp(temp uint8) bool {
+func plausibleRuntimeTemp(temp float32) bool {
 	return temp > 0 && temp <= 150
 }
 
@@ -202,7 +202,7 @@ func oduTempAt(data []byte, offset int) (float32, bool) {
 	return temp, plausibleODUTemp(temp)
 }
 
-func updateRuntimeZone(zi int, currentTemp uint8, currentHumidity uint8, heatSetpoint uint8, coolSetpoint uint8) {
+func updateRuntimeZone(zi int, currentTemp float32, currentHumidity uint8, heatSetpoint uint8, coolSetpoint uint8) {
 	if zi < 0 || zi >= len(runtimeZones) {
 		return
 	}
@@ -253,7 +253,7 @@ func isActiveZone(zi int) bool {
 }
 
 func updateRuntimeOutdoorTemp(outdoorTemp uint8) {
-	if !plausibleRuntimeTemp(outdoorTemp) {
+	if !plausibleRuntimeTemp(float32(outdoorTemp)) {
 		return
 	}
 	runtimeZoneMu.Lock()
@@ -489,7 +489,7 @@ func getZonesConfig() (*TStatZonesConfig, bool) {
 
 			zoneArr[zc] = TStatZoneConfig{
 				ZoneNumber:       uint8(zi+1),
-				CurrentTemp:      params.ZCurrentTemp[zi],
+				CurrentTemp:      float32(params.ZCurrentTemp[zi]),
 				CurrentHumidity:  params.ZCurrentHumidity[zi],
 				FanMode:          rawFanModeToString(cfg.ZFanMode[zi]),
 				Hold:             &holdz,
@@ -713,7 +713,7 @@ func getZNConfig(zi int) (*TStatZoneConfig, bool) {
 	}
 
 	out := &TStatZoneConfig{
-		CurrentTemp:     params.ZCurrentTemp[zi],
+		CurrentTemp:     float32(params.ZCurrentTemp[zi]),
 		CurrentHumidity: params.ZCurrentHumidity[zi],
 		OutdoorTemp:     params.OutdoorAirTemp,
 		Mode:            rawModeToString(params.Mode & 0xf),
@@ -1283,7 +1283,7 @@ func statePoller(monArray []uint16, interval time.Duration, pollTstatTemps bool)
 					mqttCache.update(zp+"/preset", preset)
 				}
 
-				if hum <= c1.Zones[zi].TargetHumidity || c1.Zones[zi].CurrentTemp > c1.Zones[zi].CoolSetpoint {
+				if hum <= c1.Zones[zi].TargetHumidity || c1.Zones[zi].CurrentTemp > float32(c1.Zones[zi].CoolSetpoint) {
 					potentially_drying = false
 				}
 			}
@@ -1373,28 +1373,31 @@ func attachSnoops() {
 		}
 		// Touch: currentTemp broadcast every ~20s via WRITE on 0x00060b to
 		// the heat pump. Payload byte 0 is a constant 0x01 (zone marker?);
-		// bytes 1-2 are uint16 BE / 16 = °F. Same encoding as the existing
-		// heat-pump CoilTemp decoder.
+		// bytes 1-2 are uint16 BE in 1/16 °F units. Same encoding as the
+		// existing heat-pump CoilTemp decoder.
 		if frame.op == opWRITE && len(frame.data) >= 6 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x06, 0x0b}) {
 			data := frame.data[3:]
-			temp := uint8(binary.BigEndian.Uint16(data[1:3]) / 16)
+			temp := float32(binary.BigEndian.Uint16(data[1:3])) / 16
 			if plausibleRuntimeTemp(temp) {
 				updateRuntimeZone(0, temp, 0, 0, 0)
 				markTouchThermostatDetected()
-				log.Debugf("touch thermostat 0x00060b currentTemp=%d°F raw=%x", temp, data)
+				log.Debugf("touch thermostat 0x00060b currentTemp=%.1f°F raw=%x", temp, data)
 			}
 			return
 		}
 		// Touch: combined broadcast every ~30s via WRITE on 0x000716.
-		// Layout (after 3-byte table header):
-		//   byte 4-5: outdoor/coil temp uint16 BE / 16 (zero if no reading)
-		//   byte 6:   currentHumidity %  (zero if no reading)
-		//   byte 8-9: currentTemp uint16 BE / 16 (always present)
-		// We only consume humidity here; currentTemp is already covered by
-		// the 0x00060b path above with higher cadence.
-		if frame.op == opWRITE && len(frame.data) >= 13 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x07, 0x16}) {
+		// Verified layout (after 3-byte table header), payload is 19 bytes:
+		//   byte 8-9:  currentTemp uint16 BE / 16 (always present; same value
+		//              as the 0x00060b stream, which we already consume).
+		//   byte 17:   currentHumidity % (decimal). Matches thermostat display.
+		// Other bytes (data[4-6], data[10-16], data[18]) vary or stay zero
+		// but did NOT correlate with humidity in controlled-change captures.
+		// Earlier code read data[6] which is a sensor counter that happens
+		// to wander in the 30s-70s range — produced plausible-looking but
+		// wrong readings.
+		if frame.op == opWRITE && len(frame.data) >= 21 && bytes.Equal(frame.data[0:3], []byte{0x00, 0x07, 0x16}) {
 			data := frame.data[3:]
-			humidity := data[6]
+			humidity := data[17]
 			if plausibleRuntimeHumidity(humidity) {
 				updateRuntimeZone(0, 0, humidity, 0, 0)
 				markTouchThermostatDetected()
@@ -1412,7 +1415,7 @@ func attachSnoops() {
 		}
 		zi := int(frame.src >> 8) - 0x21
 		data := frame.data[3:]
-		updateRuntimeZone(zi, data[11], data[12], data[6], data[7])
+		updateRuntimeZone(zi, float32(data[11]), data[12], data[6], data[7])
 		log.Debugf("smart sensor zone %d status: temp=%d humidity=%d heatSP=%d coolSP=%d", zi+1, data[11], data[12], data[6], data[7])
 	})
 
